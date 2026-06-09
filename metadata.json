@@ -1,0 +1,6 @@
+{
+  "name": "Pixel Sprite Extractor",
+  "description": "Convert pixel art animation videos into clean, transparent sprite frames with automatic downscaling and ZIP export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
