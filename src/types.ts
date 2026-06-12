@@ -7,7 +7,7 @@ export interface SpriteFrame {
   glowDataUrl?: string; // Translucent glow matte layer
 }
 
-export type AppTab = 'video' | 'batch' | 'translucent' | 'cleanup';
+export type AppTab = 'video' | 'batch' | 'translucent' | 'cleanup' | 'glowCleanup' | 'glowColorSimplify';
 
 export type Language = 'zh' | 'en';
 

@@ -22,7 +22,9 @@ import {
   Files,
   Folder,
   Undo,
-  RotateCcw
+  RotateCcw,
+  Plus,
+  HelpCircle
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import JSZip from 'jszip';
@@ -30,6 +32,18 @@ import { cn } from './lib/utils';
 import { SpriteFrame, AppTab, Language, PreviewMode, BlendMode, BackdropColor } from './types';
 import { i18n } from './lib/i18n';
 import { erode, dilate, defaultTrimapForImage, smartBorderSaliencyMatting } from './lib/morphology';
+import type { GlowSafeOptions } from './lib/glowSafeCleanup';
+import { hexToRgb, runGlowSafeCleanup } from './lib/glowSafeCleanup';
+import {
+  buildGlowColorPaletteFromImageDatas,
+  applyGlowColorSimplifyToImageData,
+  countGlowColorSimplifyStats,
+  rgbToHex,
+} from './lib/glowColorSimplify';
+import type {
+  RGB,
+  GlowColorSimplifyOptions,
+} from './lib/glowColorSimplify';
 
 const createClassicMattingWorker = () => {
   const workerBlobCode = `
@@ -387,6 +401,41 @@ export default function App() {
   const [isDrawingProtect, setIsDrawingProtect] = useState(false);
   const [isCleaningProgress, setIsCleaningProgress] = useState(false);
 
+  // Glow-safe Cleanup States
+  const [glowDropAlpha, setGlowDropAlpha] = useState(6);
+  const [glowFringeAlphaMax, setGlowFringeAlphaMax] = useState(64);
+  const [glowWhiteMin, setGlowWhiteMin] = useState(238);
+  const [glowSatMax, setGlowSatMax] = useState(28);
+  const [glowFringeColorTolerance, setGlowFringeColorTolerance] = useState(36);
+  const [glowEdgeRadius, setGlowEdgeRadius] = useState(2);
+  const [glowReduceFactor, setGlowReduceFactor] = useState(55);
+  const [glowBleedIterations, setGlowBleedIterations] = useState(4);
+  const [glowFringeMode, setGlowFringeMode] = useState<'reduce' | 'remove'>('reduce');
+  const [glowRemoveIsolated, setGlowRemoveIsolated] = useState(false);
+  const [glowUseRawSource, setGlowUseRawSource] = useState(true);
+  const [glowFringeColor, setGlowFringeColor] = useState('#ffffff');
+  const [glowTargetMode, setGlowTargetMode] = useState<'both' | 'target' | 'white'>('both');
+
+  // Glow Color Simplify states
+  const [glowColorTarget, setGlowColorTarget] = useState('#B8F0EF');
+  const [glowColorTolerance, setGlowColorTolerance] = useState(65);
+  const [glowColorMinAlpha, setGlowColorMinAlpha] = useState(1);
+  const [glowColorMinLuma, setGlowColorMinLuma] = useState(40);
+  const [glowColorMaxLuma, setGlowColorMaxLuma] = useState(255);
+  const [glowColorBins, setGlowColorBins] = useState(6);
+  const [glowColorStrength, setGlowColorStrength] = useState(100);
+  const [glowColorUseRawFrames, setGlowColorUseRawFrames] = useState(true);
+  const [glowColorPalette, setGlowColorPalette] = useState<[number, number, number][]>([]);
+  const [glowColorMatchedPixels, setGlowColorMatchedPixels] = useState(0);
+  const [glowColorSampledPixels, setGlowColorSampledPixels] = useState(0);
+  const [glowColorBeforeStats, setGlowColorBeforeStats] = useState<{ eligiblePixels: number; uniqueColors: number } | null>(null);
+  const [glowColorAfterStats, setGlowColorAfterStats] = useState<{ eligiblePixels: number; uniqueColors: number } | null>(null);
+  const [glowColorPipetteActive, setGlowColorPipetteActive] = useState(false);
+  const [isGlowColorSimplifying, setIsGlowColorSimplifying] = useState(false);
+  const [glowColorHistory, setGlowColorHistory] = useState<SpriteFrame[][]>([]);
+  const [showGlowCleanupGuide, setShowGlowCleanupGuide] = useState(false);
+  const [showGlowColorGuide, setShowGlowColorGuide] = useState(false);
+
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const previewTimerRef = useRef<number | null>(null);
@@ -462,18 +511,47 @@ export default function App() {
     setCurrentTab('video');
   };
 
-  const handleInitialMultipleUpload = (fileList: FileList | null) => {
-    if (!fileList || fileList.length === 0) return;
-    const files = Array.from(fileList);
-    const video = files.find(f => f.type.startsWith('video/'));
-    if (video) {
-      loadVideo(video);
-    } else {
-      const images = files.filter(f => f.type.startsWith('image/'));
+  const isImageFile = (file: File) => {
+    if (file.name.startsWith('.') || file.name.startsWith('._')) return false;
+    return file.type.startsWith('image/') || /\.(png|jpe?g|gif|webp|svg|bmp)$/i.test(file.name);
+  };
+
+  const isVideoFile = (file: File) => {
+    if (file.name.startsWith('.') || file.name.startsWith('._')) return false;
+    return file.type.startsWith('video/') || /\.(mp4|webm|ogg|mov|avi|mkv)$/i.test(file.name);
+  };
+
+  const handleGenericFileUpload = async (files: File[]) => {
+    if (files.length === 0) return;
+
+    const video = files.find(isVideoFile);
+    const images = files.filter(isImageFile);
+
+    if (currentTab === 'video') {
+      if (video) {
+        loadVideo(video);
+      } else if (images.length > 0) {
+        setBatchFiles(images);
+        setCurrentTab('batch');
+      }
+    } else if (currentTab === 'batch') {
       if (images.length > 0) {
-        loadImagesAsFrames(images);
+        setBatchFiles(images);
+      }
+    } else if (currentTab === 'translucent') {
+      if (images.length > 0) {
+        await loadImagesAsFrames(images);
+      }
+    } else { // cleanup, glowCleanup, glowColorSimplify
+      if (images.length > 0) {
+        await loadFilesDirectlyAsFrames(images);
       }
     }
+  };
+
+  const handleInitialMultipleUpload = (fileList: FileList | null) => {
+    if (!fileList || fileList.length === 0) return;
+    handleGenericFileUpload(Array.from(fileList));
   };
 
   const loadImagesAsFrames = async (files: File[]) => {
@@ -484,7 +562,9 @@ export default function App() {
     setProgress(0);
     setPreviewIndex(0);
 
-    const imageFiles = [...files].sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
+    const imageFiles = [...files]
+      .filter(isImageFile)
+      .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
 
     if (imageFiles.length === 0) {
       setIsProcessing(false);
@@ -588,7 +668,9 @@ export default function App() {
       setFrames(processedList);
       setRawFrames(rawList);
       setProgress(0);
-      setCurrentTab('translucent'); // Immediately jump to translucent editing as powerful default
+      if (currentTab === 'video' || currentTab === 'batch') {
+        setCurrentTab('translucent'); // Immediately jump to translucent editing as powerful default
+      }
     } catch (err) {
       console.error("Error loading images as frames: ", err);
     } finally {
@@ -1178,6 +1260,75 @@ export default function App() {
     }
     await Promise.all(workers);
     return results;
+  };
+
+  // Direct load files/folder as frames, bypassing preprocessing steps
+  const loadFilesDirectlyAsFrames = async (files: File[]) => {
+    if (files.length === 0) return;
+    setIsBatchRunning(true);
+    setProgress(0);
+
+    const imageFiles = [...files]
+      .filter(isImageFile)
+      .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
+
+    if (imageFiles.length === 0) {
+      setIsBatchRunning(false);
+      return;
+    }
+
+    try {
+      const frameList: SpriteFrame[] = await mapConcurrent<File, SpriteFrame>(
+        imageFiles,
+        concurrency,
+        async (file, i) => {
+          const img = new Image();
+          img.src = URL.createObjectURL(file);
+          
+          await new Promise<void>((resolve, reject) => {
+            img.onload = () => resolve();
+            img.onerror = () => reject(new Error('Failed to load image'));
+          });
+
+          const canvas = document.createElement('canvas');
+          const ctx = canvas.getContext('2d', { willReadFrequently: true });
+          if (!ctx) throw new Error("Could not construct canvas ctx");
+
+          const outWidth = img.width;
+          const outHeight = img.height;
+          canvas.width = outWidth;
+          canvas.height = outHeight;
+
+          ctx.clearRect(0, 0, outWidth, outHeight);
+          ctx.drawImage(img, 0, 0);
+
+          const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/png'));
+          if (!blob) throw new Error("Blob conversion failed");
+
+          if (videoDimensions.width === 0 || videoDimensions.height === 0) {
+            setVideoDimensions({ width: outWidth * scaleFactor, height: outHeight * scaleFactor });
+          }
+
+          return {
+            id: crypto.randomUUID(),
+            dataUrl: canvas.toDataURL('image/png'),
+            blob,
+            index: i
+          };
+        }
+      );
+
+      const sortedFrames = frameList.filter(Boolean).sort((a, b) => a.index - b.index);
+      setFrames(sortedFrames);
+      setRawFrames(sortedFrames);
+      setQuantizedFrames([]);
+      setPreviewIndex(0);
+    } catch (err) {
+      console.error("Failed to load files directly:", err);
+    } finally {
+      setIsBatchRunning(false);
+      setProgress(0);
+    }
   };
 
   // Run Batch Image Process
@@ -1872,6 +2023,31 @@ export default function App() {
 
     if (x < 0 || x >= canvas.width || y < 0 || y >= canvas.height) return;
 
+    if (currentTab === 'glowColorSimplify') {
+      if (glowColorPipetteActive) {
+        const frame = frames[previewIndex];
+        if (frame) {
+          const img = new Image();
+          img.src = frame.dataUrl;
+          img.onload = () => {
+            const tempCanvas = document.createElement('canvas');
+            tempCanvas.width = img.width;
+            tempCanvas.height = img.height;
+            const tempCtx = tempCanvas.getContext('2d');
+            if (tempCtx) {
+              tempCtx.drawImage(img, 0, 0);
+              const pixel = tempCtx.getImageData(x, y, 1, 1).data;
+              const hex = `#${[pixel[0], pixel[1], pixel[2]].map(val => val.toString(16).padStart(2, '0')).join('').toUpperCase()}`;
+              setGlowColorTarget(hex);
+              setGlowColorPalette([]);
+              setGlowColorPipetteActive(false);
+            }
+          };
+        }
+      }
+      return;
+    }
+
     if (currentTab === 'translucent') {
       // Paint Trimap mask
       const trimapVal = brushMode === 'fg' ? 255 : brushMode === 'bg' ? 0 : 128;
@@ -1900,7 +2076,7 @@ export default function App() {
         ...prev,
         [previewIndex]: updated
       }));
-    } else if (currentTab === 'cleanup') {
+    } else if (currentTab === 'cleanup' || currentTab === 'glowCleanup') {
       if (stainPipetteActive) {
         // Pipette read color under mouse position from the current active frame image
         const frame = frames[previewIndex];
@@ -1916,7 +2092,11 @@ export default function App() {
               tempCtx.drawImage(img, 0, 0);
               const pixel = tempCtx.getImageData(x, y, 1, 1).data;
               const hex = `#${[pixel[0], pixel[1], pixel[2]].map(val => val.toString(16).padStart(2, '0')).join('')}`;
-              setStainColor(hex);
+              if (currentTab === 'glowCleanup') {
+                setGlowFringeColor(hex);
+              } else {
+                setStainColor(hex);
+              }
               setStainPipetteActive(false);
             }
           };
@@ -1924,7 +2104,7 @@ export default function App() {
         return;
       }
 
-      if (cleanupProtectActive) {
+      if (currentTab === 'cleanup' && cleanupProtectActive) {
         // Paint color protection mask
         let mask = protectMasks[previewIndex];
         if (!mask) {
@@ -2070,34 +2250,426 @@ export default function App() {
     }
   };
 
+  const loadImageElement = async (src: string): Promise<HTMLImageElement> => {
+    const img = new Image();
+    img.src = src;
+    await new Promise<void>((resolve, reject) => {
+      img.onload = () => resolve();
+      img.onerror = () => reject(new Error('Failed to load image'));
+    });
+    return img;
+  };
+
+  const canvasToPngBlob = async (canvas: HTMLCanvasElement): Promise<Blob> => {
+    const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/png'));
+    if (!blob) throw new Error('Canvas PNG export failed');
+    return blob;
+  };
+
+  const getGlowColorSimplifyOptions = (): GlowColorSimplifyOptions => {
+    return {
+      targetColor: glowColorTarget,
+      targetColors: [glowColorTarget],
+      tolerance: glowColorTolerance,
+      minAlpha: glowColorMinAlpha,
+      minLuma: glowColorMinLuma,
+      maxLuma: glowColorMaxLuma,
+      bins: glowColorBins,
+      strength: glowColorStrength / 100,
+      maxSamples: 200000,
+    };
+  };
+
+  const frameToImageData = async (frame: SpriteFrame): Promise<ImageData> => {
+    const img = new Image();
+    img.src = frame.dataUrl;
+
+    await new Promise<void>((resolve, reject) => {
+      img.onload = () => resolve();
+      img.onerror = () => reject(new Error('Failed to load frame image'));
+    });
+
+    const canvas = document.createElement('canvas');
+    canvas.width = img.naturalWidth || img.width;
+    canvas.height = img.naturalHeight || img.height;
+
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) {
+      throw new Error('Could not create canvas context');
+    }
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0);
+
+    return ctx.getImageData(0, 0, canvas.width, canvas.height);
+  };
+
+  const imageDataToFrame = async (
+    imageData: ImageData,
+    sourceFrame: SpriteFrame
+  ): Promise<SpriteFrame> => {
+    const canvas = document.createElement('canvas');
+    canvas.width = imageData.width;
+    canvas.height = imageData.height;
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      throw new Error('Could not create output canvas context');
+    }
+
+    ctx.putImageData(imageData, 0, 0);
+
+    const blob = await new Promise<Blob | null>((resolve) => {
+      canvas.toBlob(resolve, 'image/png');
+    });
+
+    if (!blob) {
+      throw new Error('Failed to export glow color simplified frame');
+    }
+
+    return {
+      ...sourceFrame,
+      dataUrl: canvas.toDataURL('image/png'),
+      blob,
+    };
+  };
+
+  const getGlowColorSourceFrames = (): SpriteFrame[] => {
+    if (glowColorUseRawFrames && rawFrames.length > 0) {
+      return rawFrames;
+    }
+    return frames;
+  };
+
+  const pickPaletteSampleFrames = (sourceFrames: SpriteFrame[]): SpriteFrame[] => {
+    if (sourceFrames.length <= 12) {
+      return sourceFrames;
+    }
+    const step = Math.ceil(sourceFrames.length / 12);
+    return sourceFrames.filter((_, idx) => idx % step === 0);
+  };
+
+  const buildSharedGlowColorPalette = async (): Promise<RGB[]> => {
+    const sourceFrames = getGlowColorSourceFrames();
+    if (sourceFrames.length === 0) {
+      return [];
+    }
+    const options = getGlowColorSimplifyOptions();
+    const sampleFrames = pickPaletteSampleFrames(sourceFrames);
+
+    setProgress(0);
+    const imageDatas = await mapConcurrent<SpriteFrame, ImageData>(
+      sampleFrames,
+      Math.min(concurrency, 6),
+      async (frame) => {
+        return frameToImageData(frame);
+      }
+    );
+
+    const validImageDatas = imageDatas.filter(Boolean);
+    const result = buildGlowColorPaletteFromImageDatas(validImageDatas, options);
+
+    setGlowColorPalette(result.palette);
+    setGlowColorMatchedPixels(result.matchedPixels);
+    setGlowColorSampledPixels(result.sampledPixels);
+    setProgress(0);
+
+    return result.palette;
+  };
+
+  const runGlowColorSimplify = async (allFrames: boolean = false) => {
+    if (frames.length === 0) return;
+
+    setIsGlowColorSimplifying(true);
+    setProgress(0);
+
+    try {
+      setGlowColorHistory((prev) => [...prev, [...frames]]);
+
+      const sourceFrames = getGlowColorSourceFrames();
+      const options = getGlowColorSimplifyOptions();
+
+      let palette = glowColorPalette;
+      if (palette.length === 0) {
+        palette = await buildSharedGlowColorPalette();
+      }
+
+      if (palette.length === 0) {
+        console.warn('Glow Color Simplify: no palette generated. Check target color / tolerance.');
+        setIsGlowColorSimplifying(false);
+        return;
+      }
+
+      if (!allFrames) {
+        const sourceFrame = sourceFrames[previewIndex] ?? frames[previewIndex];
+        if (!sourceFrame) {
+          setIsGlowColorSimplifying(false);
+          return;
+        }
+
+        const beforeData = await frameToImageData(sourceFrame);
+        const beforeStats = countGlowColorSimplifyStats(beforeData, options);
+        const resultData = applyGlowColorSimplifyToImageData(beforeData, palette, options);
+        const afterStats = countGlowColorSimplifyStats(resultData, options);
+
+        const resultFrame = await imageDataToFrame(resultData, frames[previewIndex] ?? sourceFrame);
+
+        const updated = [...frames];
+        updated[previewIndex] = {
+          ...resultFrame,
+          index: frames[previewIndex]?.index ?? previewIndex,
+        };
+
+        setGlowColorBeforeStats(beforeStats);
+        setGlowColorAfterStats(afterStats);
+        setFrames(updated);
+        setQuantizedFrames([]);
+        setProgress(0);
+        setIsGlowColorSimplifying(false);
+        return;
+      }
+
+      const processed = await mapConcurrent<SpriteFrame, SpriteFrame>(
+        sourceFrames,
+        concurrency,
+        async (sourceFrame, idx) => {
+          const beforeData = await frameToImageData(sourceFrame);
+          const resultData = applyGlowColorSimplifyToImageData(beforeData, palette, options);
+          const baseFrame = frames[idx] ?? sourceFrame;
+          return imageDataToFrame(resultData, baseFrame);
+        }
+      );
+
+      const validFrames = processed
+        .filter(Boolean)
+        .sort((a, b) => a.index - b.index);
+
+      const previewFrame = validFrames[previewIndex];
+      if (previewFrame) {
+        const beforeData = await frameToImageData(sourceFrames[previewIndex] ?? previewFrame);
+        const afterData = await frameToImageData(previewFrame);
+        setGlowColorBeforeStats(countGlowColorSimplifyStats(beforeData, options));
+        setGlowColorAfterStats(countGlowColorSimplifyStats(afterData, options));
+      }
+
+      setFrames(validFrames);
+      setQuantizedFrames([]);
+    } catch (err) {
+      console.error('Glow Color Simplify failed:', err);
+    } finally {
+      setProgress(0);
+      setIsGlowColorSimplifying(false);
+    }
+  };
+
+  const undoGlowColorSimplify = () => {
+    if (glowColorHistory.length === 0) return;
+    const prev = glowColorHistory[glowColorHistory.length - 1];
+    setFrames(prev);
+    setGlowColorHistory(glowColorHistory.slice(0, -1));
+  };
+
+  const commitGlowColorSimplify = () => {
+    setRawFrames([...frames]);
+    setQuantizedFrames([]);
+    setGlowColorHistory([]);
+    setGlowColorPalette([]);
+    setGlowColorBeforeStats(null);
+    setGlowColorAfterStats(null);
+  };
+
+  const buildGlowSafeOptions = (): GlowSafeOptions => ({
+    dropAlpha: glowDropAlpha,
+    fringeAlphaMax: glowFringeAlphaMax,
+    whiteMin: glowWhiteMin,
+    satMax: glowSatMax,
+    fringeColor: hexToRgb(glowFringeColor),
+    fringeColorTolerance: glowFringeColorTolerance,
+    edgeRadius: glowEdgeRadius,
+    fringeMode: glowFringeMode,
+    reduceFactor: glowReduceFactor / 100,
+    bleedIterations: glowBleedIterations,
+    removeIsolated: glowRemoveIsolated,
+    isolatedMinNeighbors: 1,
+    targetMode: glowTargetMode,
+  });
+
+  const processOneFrameWithGlowSafeCleanup = async (
+    sourceFrame: SpriteFrame,
+    outputBaseFrame: SpriteFrame,
+    frameIndex: number,
+    options: GlowSafeOptions,
+  ): Promise<SpriteFrame> => {
+    const img = await loadImageElement(sourceFrame.dataUrl);
+
+    const canvas = document.createElement('canvas');
+    const width = img.naturalWidth || img.width;
+    const height = img.naturalHeight || img.height;
+    canvas.width = width;
+    canvas.height = height;
+
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) throw new Error('Failed to create canvas context for glow-safe cleanup');
+
+    ctx.clearRect(0, 0, width, height);
+    ctx.drawImage(img, 0, 0);
+
+    const imgData = ctx.getImageData(0, 0, width, height);
+    const protect = protectMasks[frameIndex];
+    const validProtect = protect && protect.length === width * height ? protect : undefined;
+
+    const cleaned = runGlowSafeCleanup(imgData, options, validProtect);
+    ctx.putImageData(cleaned, 0, 0);
+
+    const blob = await canvasToPngBlob(canvas);
+
+    return {
+      ...outputBaseFrame,
+      dataUrl: canvas.toDataURL('image/png'),
+      blob,
+      // 清理 final 后，旧的 core/glow 分层结果可能已经不匹配。
+      // 如果用户需要 dual export，应在清理后重新运行 translucent matting。
+      coreDataUrl: undefined,
+      glowDataUrl: undefined,
+    };
+  };
+
+  const runGlowSafeCleaner = async (allFrames: boolean = false) => {
+    if (frames.length === 0) return;
+    setIsCleaningProgress(true);
+    setProgress(0);
+
+    // 保存历史，支持 Undo。
+    setCleanupHistory(prev => [...prev, [...frames]]);
+
+    const options = buildGlowSafeOptions();
+
+    try {
+      if (!allFrames) {
+        const currentOutputFrame = frames[previewIndex];
+        if (!currentOutputFrame) return;
+
+        const sourceFrame =
+          glowUseRawSource && rawFrames[previewIndex]
+            ? rawFrames[previewIndex]
+            : currentOutputFrame;
+
+        const cleanedFrame = await processOneFrameWithGlowSafeCleanup(
+          sourceFrame,
+          currentOutputFrame,
+          previewIndex,
+          options,
+        );
+
+        const updated = [...frames];
+        updated[previewIndex] = cleanedFrame;
+        setFrames(updated);
+        setQuantizedFrames([]);
+        setProgress(100);
+      } else {
+        const sourceList =
+          glowUseRawSource && rawFrames.length === frames.length
+            ? rawFrames
+            : frames;
+
+        const cleaned = await mapConcurrent<SpriteFrame, SpriteFrame>(
+          sourceList,
+          concurrency,
+          async (sourceFrame, i) => {
+            const outputBaseFrame = frames[i] || sourceFrame;
+            return processOneFrameWithGlowSafeCleanup(
+              sourceFrame,
+              outputBaseFrame,
+              i,
+              options,
+            );
+          },
+        );
+
+        const validCleaned = cleaned
+          .filter(Boolean)
+          .sort((a, b) => a.index - b.index);
+
+        setFrames(validCleaned);
+        setQuantizedFrames([]);
+      }
+    } catch (err) {
+      console.error('Glow-safe cleanup failed:', err);
+    } finally {
+      setIsCleaningProgress(false);
+      setProgress(0);
+    }
+  };
+
   // ZIP package exporter (multi-tier output directory mapping!)
   const downloadZipPackage = async () => {
     if (frames.length === 0) return;
 
     const zip = new JSZip();
 
-    if (currentTab === 'translucent' && gameDualExportChecked) {
-      // Specialized multi-texture setup
-      const finalFolder = zip.folder("final");
-      const coreFolder = zip.folder("core");
-      const glowFolder = zip.folder("glow");
+    if (currentTab === 'translucent') {
+      if (gameDualExportChecked) {
+        // Specialized multi-texture setup
+        const finalFolder = zip.folder("final");
+        const coreFolder = zip.folder("core");
+        const glowFolder = zip.folder("glow");
 
-      for (let idx = 0; idx < frames.length; idx++) {
-        const frame = frames[idx];
-        const filename = `frame_${idx.toString().padStart(4, '0')}.png`;
-        finalFolder?.file(filename, frame.blob);
+        for (let idx = 0; idx < frames.length; idx++) {
+          const frame = frames[idx];
+          const filename = `frame_${idx.toString().padStart(4, '0')}.png`;
 
-        if (frame.coreDataUrl) {
-          const coreBlob = await fetch(frame.coreDataUrl).then(r => r.blob());
-          coreFolder?.file(filename, coreBlob);
+          if (pureGlowMode && frame.coreDataUrl) {
+            // Under pureGlowMode, final should not blend glow effect, so we use core
+            const coreBlob = await fetch(frame.coreDataUrl).then(r => r.blob());
+            finalFolder?.file(filename, coreBlob);
+            coreFolder?.file(filename, coreBlob);
+          } else {
+            finalFolder?.file(filename, frame.blob);
+            if (frame.coreDataUrl) {
+              const coreBlob = await fetch(frame.coreDataUrl).then(r => r.blob());
+              coreFolder?.file(filename, coreBlob);
+            }
+          }
+
+          if (frame.glowDataUrl) {
+            const glowBlob = await fetch(frame.glowDataUrl).then(r => r.blob());
+            glowFolder?.file(filename, glowBlob);
+          }
         }
-        if (frame.glowDataUrl) {
-          const glowBlob = await fetch(frame.glowDataUrl).then(r => r.blob());
-          glowFolder?.file(filename, glowBlob);
+      } else {
+        // Single sprite sheet mode
+        if (pureGlowMode) {
+          // Add a glow folder inside zip, and final sprites should be core (no glow)
+          const spritesFolder = zip.folder("sprites");
+          const glowFolder = zip.folder("glow");
+
+          for (let idx = 0; idx < frames.length; idx++) {
+            const frame = frames[idx];
+            const filename = `frame_${idx.toString().padStart(4, '0')}.png`;
+
+            if (frame.coreDataUrl) {
+              const coreBlob = await fetch(frame.coreDataUrl).then(r => r.blob());
+              spritesFolder?.file(filename, coreBlob);
+            } else {
+              spritesFolder?.file(filename, frame.blob);
+            }
+
+            if (frame.glowDataUrl) {
+              const glowBlob = await fetch(frame.glowDataUrl).then(r => r.blob());
+              glowFolder?.file(filename, glowBlob);
+            }
+          }
+        } else {
+          // Normal zip packing
+          const spritesFolder = zip.folder("sprites");
+          frames.forEach((frame, idx) => {
+            const filename = `frame_${idx.toString().padStart(4, '0')}.png`;
+            spritesFolder?.file(filename, frame.blob);
+          });
         }
       }
     } else {
-      // Default direct ZIP packing
+      // Default direct ZIP packing for other tabs
       const spritesFolder = zip.folder("sprites");
       frames.forEach((frame, idx) => {
         const filename = `frame_${idx.toString().padStart(4, '0')}.png`;
@@ -2160,13 +2732,35 @@ export default function App() {
       onDrop={(e) => {
         e.preventDefault();
         setIsDragging(false);
-        const file = e.dataTransfer.files?.[0];
-        if (file) {
-          if (file.type.startsWith('video/')) loadVideo(file);
-          else if (file.type.startsWith('image/')) setBatchFiles(Array.from(e.dataTransfer.files));
+        if (e.dataTransfer.files) {
+          handleGenericFileUpload(Array.from(e.dataTransfer.files));
         }
       }}
     >
+      {/* Global persistent file inputs */}
+      <input 
+        id="initial-upload-trigger" 
+        type="file" 
+        className="hidden" 
+        accept="image/*,video/*" 
+        multiple 
+        onChange={(e) => {
+          handleGenericFileUpload(Array.from(e.target.files || []));
+          e.target.value = '';
+        }} 
+      />
+      <input 
+        id="folder-upload-trigger" 
+        type="file" 
+        className="hidden" 
+        multiple 
+        {...({ webkitdirectory: "", directory: "" } as any)}
+        onChange={(e) => {
+          handleGenericFileUpload(Array.from(e.target.files || []));
+          e.target.value = '';
+        }} 
+      />
+
       {/* Drag & Drop Window Mask */}
       <AnimatePresence>
         {isDragging && (
@@ -2202,7 +2796,7 @@ export default function App() {
         </div>
 
         {/* Tab selection links */}
-        <div className="flex bg-slate-100 p-1 rounded-xl border border-slate-200 max-w-lg">
+        <div className="flex bg-slate-100 p-1 rounded-xl border border-slate-200 max-w-4xl shadow-sm">
           <button 
             type="button"
             onClick={() => setCurrentTab('video')}
@@ -2234,6 +2828,22 @@ export default function App() {
           >
             <Pipette className="w-3.5 h-3.5" />
             {t('edgeCleanup')}
+          </button>
+          <button 
+            type="button"
+            onClick={() => setCurrentTab('glowCleanup')}
+            className={cn("px-4 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5", currentTab === 'glowCleanup' ? "bg-white text-indigo-600 shadow" : "text-slate-500 hover:text-slate-800")}
+          >
+            <Sparkles className="w-3.5 h-3.5 text-indigo-400" />
+            {lang === 'zh' ? '光效安全清理' : 'Glow Safe'}
+          </button>
+          <button 
+            type="button"
+            onClick={() => setCurrentTab('glowColorSimplify')}
+            className={cn("px-4 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5", currentTab === 'glowColorSimplify' ? "bg-white text-indigo-600 shadow" : "text-slate-500 hover:text-slate-800")}
+          >
+            <Sparkles className="w-3.5 h-3.5 text-amber-500" />
+            {lang === 'zh' ? '光效色阶整理' : 'Glow Colors'}
           </button>
         </div>
 
@@ -3030,11 +3640,915 @@ export default function App() {
                       setInitialCleanupState([...frames]);
                       setCleanupHistory([]);
                     }}
-                    className="w-full py-3.5 rounded-xl border border-dashed border-emerald-500 bg-emerald-50/50 text-emerald-700 hover:bg-emerald-50 hover:scale-[1.01] transition-all font-bold text-[10px] uppercase tracking-wider flex items-center justify-center gap-1.5 animate-pulse"
+                    className="w-full py-3.5 rounded-xl border border-dashed border-emerald-500 bg-emerald-50/50 text-emerald-700 hover:bg-emerald-50 hover:scale-[1.01] transition-all font-bold text-[10px] uppercase tracking-wider flex items-center justify-center gap-1.5"
                   >
                     <Check className="w-4 h-4" />
                     {t('updateCommitBtn')}
                   </button>
+                </>
+              )}
+            </div>
+          )}
+
+          {/* TAB 5: GLOW-SAFE CLEANUP Controls */}
+          {currentTab === 'glowCleanup' && (
+            <div className="flex flex-col gap-5">
+              <div className="flex items-center justify-between gap-2 border-b border-slate-100 pb-2">
+                <h3 className="text-sm font-bold text-slate-800 uppercase tracking-widest">
+                  {lang === 'zh' ? '光效安全清理' : 'Glow-safe Cleanup'}
+                </h3>
+                <button
+                  type="button"
+                  onClick={() => setShowGlowCleanupGuide(!showGlowCleanupGuide)}
+                  className={cn(
+                    "px-2 py-1 rounded-lg transition-colors flex items-center gap-1 text-[10px] font-bold border shrink-0 cursor-pointer shadow-sm",
+                    showGlowCleanupGuide
+                      ? "bg-indigo-50 border-indigo-200 text-indigo-700"
+                      : "bg-white border-slate-200 text-slate-500 hover:bg-slate-50"
+                  )}
+                  title={lang === 'zh' ? '控制参数指南说明' : 'View parameter guide'}
+                >
+                  <HelpCircle className="w-3.5 h-3.5" />
+                  {lang === 'zh' ? '说明指南' : 'Guide'}
+                </button>
+              </div>
+
+              {showGlowCleanupGuide && (
+                <div className="p-3.5 bg-indigo-50 border border-indigo-100 rounded-xl flex flex-col gap-2 shadow-inner text-[10px] text-indigo-950 font-medium leading-relaxed">
+                  <div className="font-bold text-indigo-900 border-b border-indigo-200 pb-1.5 flex items-center gap-1.5 font-sans">
+                    <HelpCircle className="w-4 h-4 text-indigo-600" />
+                    <span>{lang === 'zh' ? '💡 参数效果及调整提示' : '💡 Parameter Effects & Tips'}</span>
+                  </div>
+                  {lang === 'zh' ? (
+                    <ul className="list-disc pl-4 flex flex-col gap-1.5 text-[9px] text-indigo-850 font-medium">
+                      <li><strong>检测模式:</strong> 支持【白色高光/亮灰】与【指定颜色】双重检测，吸取荧光边缘更有效。</li>
+                      <li><strong>降Alpha vs 强力删除:</strong> 降Alpha是按比例乘以不透明度（温和柔边），删除是直接置零（硬直边缘）。</li>
+                      <li><strong>DROP ALPHA:</strong> 半透明度低于该阈值（0-24）的像素直接化为完全透明，清除毛刺。</li>
+                      <li><strong>FRINGE ALPHA MAX:</strong> 判定像素为边缘的最高不透明度。高出此不透明度的内层纯色点将不被清洗，从而保护原画主体。</li>
+                      <li><strong>WHITE MIN / SAT MAX:</strong> 设定高光白边的亮度门槛和最高饱和度，极低饱和极高亮度像素在白边模式将被重点捕获。</li>
+                      <li><strong>COLOR TOL:</strong> 指定颜色的检索相似度容差，对发光渐变边缘，可拉大改参数大批量捕获相似色度。</li>
+                      <li><strong>REDUCE %:</strong> 在“降Alpha”模式下作用的缩紧比例，如 30-50% 让外框白边柔和。</li>
+                      <li><strong>BLEED 扩色:</strong> 将图形中央的饱满原色智慧扩充涂抹（2px~6px）。不仅完美消灭发光晕、还能用正确的内部色补齐轮廓，对2.5D及像素均极力推荐！</li>
+                    </ul>
+                  ) : (
+                    <ul className="list-disc pl-4 flex flex-col gap-1.5 text-[9px] text-indigo-850 font-medium">
+                      <li><strong>Detection Mode:</strong> Target white light, your custom sample hue, or combining both.</li>
+                      <li><strong>Reduce Alpha vs Remove:</strong> Reduce diminishes matching edge opacity by a factor; Remove erases those pixels completely.</li>
+                      <li><strong>DROP ALPHA:</strong> Erases low-opacity ghost pixels with alpha values below this setting (range: 0-24).</li>
+                      <li><strong>FRINGE ALPHA MAX:</strong> Maximum alpha limit. Protects solid core pixels of the inner art from being touched.</li>
+                      <li><strong>WHITE MIN & SAT MAX:</strong> Thresholds defining the brightness floor and saturation ceiling for "white highlights".</li>
+                      <li><strong>COLOR TOL:</strong> Color tolerance for the custom color picker. Higher values cover wider glow ranges.</li>
+                      <li><strong>REDUCE %:</strong> Alpha scaling coefficient. Smaller scale factors compress thin margins heavily.</li>
+                      <li><strong>BLEED Iterations:</strong> Expands internal flat art artwork colors outwards (2-6px) to replace cleaned neon borders with accurate solid pixels. Highly recommended!</li>
+                    </ul>
+                  )}
+                </div>
+              )}
+
+              {frames.length === 0 ? (
+                // Quick Media Import Sidebar Panel for Glow Cleanup
+                <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl flex flex-col gap-3 shadow-sm">
+                  <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">{lang === 'zh' ? '在此导入媒体' : 'Import Media Here'}</span>
+                  <p className="text-[10px] text-slate-400 font-medium leading-relaxed">
+                    {lang === 'zh' 
+                      ? '光效安全清理支持视频、单张或多张图片以及整个文件夹。' 
+                      : 'Glow-safe cleanup handles frame clearance of any single image, folder of assets, or video.'}
+                  </p>
+                  
+                  <div className="flex flex-col gap-2 mt-1">
+                    <button
+                      type="button"
+                      onClick={() => document.getElementById('initial-upload-trigger')?.click()}
+                      className="w-full py-2 bg-indigo-600 text-white rounded-lg text-xs font-bold hover:bg-indigo-700 transition flex items-center justify-center gap-1.5 shadow"
+                    >
+                      <Upload className="w-3.5 h-3.5" />
+                      {lang === 'zh' ? '导入源素材' : 'Import Media'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => document.getElementById('folder-upload-trigger')?.click()}
+                      className="w-full py-2 bg-white border border-slate-200 text-slate-700 rounded-lg text-xs font-bold hover:bg-slate-50 transition flex items-center justify-center gap-1.5 shadow-sm"
+                    >
+                      <Folder className="w-3.5 h-3.5 text-indigo-600" />
+                      {t('selectFolder')}
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <p className="text-[10px] text-slate-400 font-semibold leading-relaxed">
+                    {lang === 'zh'
+                      ? '该流程专注清理 PNG 的发光边缘白杂边及 Alpha 杂色，并进行透明像素 RGB 填充扩色避开全局归一。'
+                      : 'Specialized to clean edge fringes and bleed colors for premium game visual assets.'}
+                  </p>
+
+                  {/* Backdrop checker */}
+                  <div className="flex flex-col gap-1.5">
+                    <span className="text-[9px] font-bold text-slate-500 uppercase">{t('canvasBG')}</span>
+                    <div className="grid grid-cols-5 gap-1.5">
+                      <button 
+                        type="button"
+                        title={t('transparentCheck')}
+                        onClick={() => setCleanupBGMock('transparent')}
+                        className={cn("aspect-square rounded border-2 checkerboard", cleanupBGMock === 'transparent' ? 'border-indigo-600 scale-105 shadow' : 'border-slate-200')}
+                      />
+                      <button 
+                        type="button"
+                        title={t('whiteBG')}
+                        onClick={() => setCleanupBGMock('white')}
+                        className={cn("aspect-square rounded border-2 bg-white", cleanupBGMock === 'white' ? 'border-slate-800 scale-105 shadow' : 'border-slate-200')}
+                      />
+                      <button 
+                        type="button"
+                        title={t('blackBG')}
+                        onClick={() => setCleanupBGMock('black')}
+                        className={cn("aspect-square rounded border-2 bg-black", cleanupBGMock === 'black' ? 'border-slate-800 scale-105 shadow' : 'border-slate-200')}
+                      />
+                      <button 
+                        type="button"
+                        title={t('greenBG')}
+                        onClick={() => setCleanupBGMock('green')}
+                        className={cn("aspect-square rounded border-2 bg-[#00ff00]", cleanupBGMock === 'green' ? 'border-slate-800 scale-105 shadow' : 'border-slate-200')}
+                      />
+                      <button 
+                        type="button"
+                        title={t('pinkBG')}
+                        onClick={() => setCleanupBGMock('pink')}
+                        className={cn("aspect-square rounded border-2 bg-[#ff00ff]", cleanupBGMock === 'pink' ? 'border-slate-800 scale-105 shadow' : 'border-slate-200')}
+                      />
+                    </div>
+                  </div>
+
+                  {/* Target Color Configurator */}
+                  <div className="p-4 bg-slate-50 border border-slate-100 rounded-xl flex flex-col gap-3">
+                    <span className="text-[9px] font-bold text-slate-500 uppercase tracking-wider">
+                      {lang === 'zh' ? '杂边目标颜色检测设定' : 'Target Color Detection'}
+                    </span>
+
+                    {/* Target color select mode */}
+                    <div className="flex flex-col gap-1.5">
+                      <span className="text-[9px] font-bold text-slate-400 uppercase">
+                        {lang === 'zh' ? '检测模式' : 'Detection Mode'}
+                      </span>
+                      <select 
+                        value={glowTargetMode}
+                        onChange={(e) => setGlowTargetMode(e.target.value as any)}
+                        className="text-xs font-medium border border-slate-200 rounded-lg p-2 bg-white text-slate-700 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                      >
+                        <option value="both">{lang === 'zh' ? '指定颜色 & 白色/亮灰' : 'Target Color & White'}</option>
+                        <option value="target">{lang === 'zh' ? '仅清理指定颜色' : 'Target Color Only'}</option>
+                        <option value="white">{lang === 'zh' ? '仅清理白色/亮灰' : 'White Only'}</option>
+                      </select>
+                    </div>
+
+                    {/* Specified Color and pipette */}
+                    {glowTargetMode !== 'white' && (
+                      <div className="flex flex-col gap-1.5">
+                        <span className="text-[9px] font-bold text-slate-400 uppercase">
+                          {lang === 'zh' ? '指定检测颜色' : 'Specified Fringe Color'}
+                        </span>
+                        <div className="flex gap-2">
+                          <div className="relative flex-1 h-9 rounded-xl border bg-white p-2 flex items-center gap-2 shadow-sm">
+                            <div className="w-5 h-5 rounded border shadow-inner transition-colors" style={{ backgroundColor: glowFringeColor }} />
+                            <span className="text-[10px] font-mono font-bold text-slate-600 uppercase">{glowFringeColor}</span>
+                            <input 
+                              type="color" 
+                              value={glowFringeColor} 
+                              onChange={(e) => setGlowFringeColor(e.target.value)} 
+                              className="absolute inset-0 opacity-0 cursor-pointer" 
+                            />
+                          </div>
+                          <button 
+                            type="button"
+                            onClick={() => setStainPipetteActive(!stainPipetteActive)}
+                            className={cn(
+                              "p-2 rounded-xl border flex items-center justify-center transition shadow-sm", 
+                              stainPipetteActive 
+                                ? "bg-indigo-600 text-white border-indigo-600" 
+                                : "bg-white text-slate-600 border-slate-200 hover:bg-slate-50"
+                            )}
+                            title="Pipette tool"
+                          >
+                            <Pipette className="w-4 h-4" />
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Glow-safe Cleanup settings */}
+                  <div className="p-4 bg-indigo-50/60 border border-indigo-100 rounded-xl flex flex-col gap-3">
+                    <div className="flex flex-col gap-1">
+                      <span className="text-xs font-bold text-indigo-900">
+                        {lang === 'zh' ? '清理算法参数' : 'Parameters'}
+                      </span>
+                    </div>
+
+                    <div className="flex items-center gap-2 px-1">
+                      <input
+                        type="checkbox"
+                        id="glow-use-raw-source"
+                        checked={glowUseRawSource}
+                        onChange={(e) => setGlowUseRawSource(e.target.checked)}
+                        className="rounded text-indigo-600"
+                      />
+                      <label htmlFor="glow-use-raw-source" className="text-[10px] font-bold text-indigo-800 cursor-pointer">
+                        {lang === 'zh' ? '优先从 rawFrames / 原始帧重新处理' : 'Prefer rawFrames as source'}
+                      </label>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setGlowFringeMode('reduce')}
+                        className={cn(
+                          'py-2 rounded-lg text-[10px] font-bold border transition',
+                          glowFringeMode === 'reduce'
+                            ? 'bg-white text-indigo-700 border-indigo-300 shadow-sm'
+                            : 'bg-indigo-100/50 text-indigo-500 border-indigo-100'
+                        )}
+                      >
+                        {lang === 'zh' ? '保守降 Alpha' : 'Reduce Alpha'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setGlowFringeMode('remove')}
+                        className={cn(
+                          'py-2 rounded-lg text-[10px] font-bold border transition',
+                          glowFringeMode === 'remove'
+                            ? 'bg-white text-rose-700 border-rose-300 shadow-sm'
+                            : 'bg-indigo-100/50 text-indigo-500 border-indigo-100'
+                        )}
+                      >
+                        {lang === 'zh' ? '强力删除' : 'Remove'}
+                      </button>
+                    </div>
+
+                    <div className="flex flex-col gap-2">
+                      <div className="flex justify-between items-center">
+                        <span className="text-[9px] font-bold text-indigo-700">DROP ALPHA</span>
+                        <span className="text-[10px] font-mono font-bold text-indigo-900">{glowDropAlpha}</span>
+                      </div>
+                      <input
+                        type="range"
+                        min="0"
+                        max="24"
+                        step="1"
+                        value={glowDropAlpha}
+                        onChange={(e) => setGlowDropAlpha(parseInt(e.target.value, 10))}
+                        className="w-full accent-indigo-600"
+                      />
+                    </div>
+
+                    <div className="flex flex-col gap-2">
+                      <div className="flex justify-between items-center">
+                        <span className="text-[9px] font-bold text-indigo-700">FRINGE ALPHA MAX</span>
+                        <span className="text-[10px] font-mono font-bold text-indigo-900">{glowFringeAlphaMax}</span>
+                      </div>
+                      <input
+                        type="range"
+                        min="16"
+                        max="160"
+                        step="1"
+                        value={glowFringeAlphaMax}
+                        onChange={(e) => setGlowFringeAlphaMax(parseInt(e.target.value, 10))}
+                        className="w-full accent-indigo-600"
+                      />
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="flex flex-col gap-1.5">
+                        <div className="flex justify-between items-center">
+                          <span className="text-[9px] font-bold text-indigo-700">WHITE MIN</span>
+                          <span className="text-[10px] font-mono font-bold text-indigo-900">{glowWhiteMin}</span>
+                        </div>
+                        <input
+                          type="range"
+                          min="200"
+                          max="255"
+                          step="1"
+                          value={glowWhiteMin}
+                          onChange={(e) => setGlowWhiteMin(parseInt(e.target.value, 10))}
+                          className="w-full accent-indigo-600"
+                        />
+                      </div>
+
+                      <div className="flex flex-col gap-1.5">
+                        <div className="flex justify-between items-center">
+                          <span className="text-[9px] font-bold text-indigo-700">SAT MAX</span>
+                          <span className="text-[10px] font-mono font-bold text-indigo-900">{glowSatMax}</span>
+                        </div>
+                        <input
+                          type="range"
+                          min="0"
+                          max="80"
+                          step="1"
+                          value={glowSatMax}
+                          onChange={(e) => setGlowSatMax(parseInt(e.target.value, 10))}
+                          className="w-full accent-indigo-600"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="flex flex-col gap-1.5">
+                        <div className="flex justify-between items-center">
+                          <span className="text-[9px] font-bold text-indigo-700">COLOR TOL</span>
+                          <span className="text-[10px] font-mono font-bold text-indigo-900">{glowFringeColorTolerance}</span>
+                        </div>
+                        <input
+                          type="range"
+                          min="0"
+                          max="120"
+                          step="1"
+                          value={glowFringeColorTolerance}
+                          onChange={(e) => setGlowFringeColorTolerance(parseInt(e.target.value, 10))}
+                          className="w-full accent-indigo-600"
+                        />
+                      </div>
+
+                      <div className="flex flex-col gap-1.5">
+                        <div className="flex justify-between items-center">
+                          <span className="text-[9px] font-bold text-indigo-700">EDGE RADIUS</span>
+                          <span className="text-[10px] font-mono font-bold text-indigo-900">{glowEdgeRadius}</span>
+                        </div>
+                        <input
+                          type="range"
+                          min="1"
+                          max="3"
+                          step="1"
+                          value={glowEdgeRadius}
+                          onChange={(e) => setGlowEdgeRadius(parseInt(e.target.value, 10))}
+                          className="w-full accent-indigo-600"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="flex flex-col gap-1.5">
+                        <div className="flex justify-between items-center">
+                          <span className="text-[9px] font-bold text-indigo-700">REDUCE %</span>
+                          <span className="text-[10px] font-mono font-bold text-indigo-900">{glowReduceFactor}%</span>
+                        </div>
+                        <input
+                          type="range"
+                          min="20"
+                          max="90"
+                          step="1"
+                          value={glowReduceFactor}
+                          disabled={glowFringeMode === 'remove'}
+                          onChange={(e) => setGlowReduceFactor(parseInt(e.target.value, 10))}
+                          className="w-full accent-indigo-600 disabled:opacity-30"
+                        />
+                      </div>
+
+                      <div className="flex flex-col gap-1.5">
+                        <div className="flex justify-between items-center">
+                          <span className="text-[9px] font-bold text-indigo-700">BLEED</span>
+                          <span className="text-[10px] font-mono font-bold text-indigo-900">{glowBleedIterations}px</span>
+                        </div>
+                        <input
+                          type="range"
+                          min="0"
+                          max="8"
+                          step="1"
+                          value={glowBleedIterations}
+                          onChange={(e) => setGlowBleedIterations(parseInt(e.target.value, 10))}
+                          className="w-full accent-indigo-600"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-2 px-1">
+                      <input
+                        type="checkbox"
+                        id="glow-remove-isolated"
+                        checked={glowRemoveIsolated}
+                        onChange={(e) => setGlowRemoveIsolated(e.target.checked)}
+                        className="rounded text-indigo-600"
+                      />
+                      <label htmlFor="glow-remove-isolated" className="text-[10px] font-bold text-indigo-800 cursor-pointer">
+                        {lang === 'zh' ? '删除孤立单点噪声' : 'Remove isolated dots'}
+                      </label>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2 pt-1 border-t border-indigo-100/50 mt-1">
+                      <button
+                        type="button"
+                        onClick={() => runGlowSafeCleaner(false)}
+                        disabled={isCleaningProgress}
+                        className="py-2.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-200 disabled:text-slate-400 text-white font-bold text-[9px] uppercase tracking-wider transition shadow-sm"
+                      >
+                        {isCleaningProgress ? `${progress}%` : (lang === 'zh' ? '清理当前帧' : 'Clean Current')}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => runGlowSafeCleaner(true)}
+                        disabled={isCleaningProgress}
+                        className="py-2.5 rounded-lg bg-white border border-indigo-200 text-indigo-700 hover:bg-indigo-50 disabled:bg-slate-100 disabled:text-slate-400 font-bold text-[9px] uppercase tracking-wider transition font-mono shadow-sm"
+                      >
+                        {isCleaningProgress ? `${progress}%` : (lang === 'zh' ? '清理全部帧' : 'Clean All')}
+                      </button>
+                    </div>
+
+                    {/* Disclaimers & tips */}
+                    <p className="text-[8px] text-indigo-600/70 leading-normal font-semibold italic">
+                      {lang === 'zh' 
+                        ? '* 清理后会清空分层缓存，如需导出 Glow 分离图集，请在清理完成后重新运行一遍 “分层半透明抠图”。' 
+                        : '* Cleaning will clear dual layer caches. Run "Translucent Matting" again if dual export is needed.'}
+                    </p>
+                  </div>
+
+                  {/* Protected Mask Paint */}
+                  <div className="p-4 bg-white border border-slate-100 rounded-xl flex flex-col gap-3 shadow-inner">
+                    <div className="flex flex-col gap-0.5">
+                      <span className="text-xs font-bold text-slate-700">{t('protectBrushTitle')}</span>
+                      <p className="text-[9px] text-slate-400 font-semibold leading-relaxed">{t('protectBrushDesc')}</p>
+                    </div>
+
+                    <div className="flex gap-2">
+                      <button 
+                        type="button"
+                        onClick={() => setCleanupProtectActive(!cleanupProtectActive)}
+                        className={cn("flex-1 py-2 rounded-lg text-[10px] font-bold transition flex items-center justify-center gap-1.5 border", cleanupProtectActive ? "bg-red-500 text-white border-red-600 shadow" : "bg-white text-slate-700 border-slate-200")}
+                      >
+                        <Brush className="w-3.5 h-3.5" />
+                        {t('addProtectMask')}
+                      </button>
+                      <button 
+                        type="button"
+                        onClick={() => {
+                          setProtectMasks(prev => ({ ...prev, [previewIndex]: new Uint8Array(0) }));
+                        }}
+                        className="flex-1 py-2 rounded-lg bg-white hover:bg-slate-50 text-slate-500 border border-slate-200 font-bold text-[10px] transition"
+                      >
+                        {t('clearProtectMask')}
+                      </button>
+                    </div>
+
+                    <div className="flex justify-between items-center py-0.5">
+                      <span className="text-[9px] font-bold text-slate-500">RADIUS</span>
+                      <span className="text-slate-700 font-mono text-[10px] font-bold">{cleanupBrushSize}px</span>
+                    </div>
+                    <input type="range" min="1" max="40" value={cleanupBrushSize} onChange={(e) => setCleanupBrushSize(parseInt(e.target.value))} className="w-full accent-indigo-600" />
+                  </div>
+
+                  {/* Commit changes */}
+                  <button 
+                    type="button"
+                    onClick={() => {
+                      setRawFrames([...frames]);
+                      setQuantizedFrames([]);
+                      setInitialCleanupState([...frames]);
+                      setCleanupHistory([]);
+                    }}
+                    className="w-full py-3.5 rounded-xl border border-dashed border-emerald-500 bg-emerald-50/50 text-emerald-700 hover:bg-emerald-50 hover:scale-[1.01] transition-all font-bold text-[10px] uppercase tracking-wider flex items-center justify-center gap-1.5"
+                  >
+                    <Check className="w-4 h-4" />
+                    {t('updateCommitBtn')}
+                  </button>
+                </>
+              )}
+            </div>
+          )}
+
+          {/* TAB 6: GLOW-COLOR-SIMPLIFY Controls */}
+          {currentTab === 'glowColorSimplify' && (
+            <div className="flex flex-col gap-5">
+              <div className="flex items-center justify-between gap-2 border-b border-slate-100 pb-2">
+                <h3 className="text-sm font-bold text-slate-800 uppercase tracking-widest">
+                  {lang === 'zh' ? '光效色阶整理' : 'Glow Colors'}
+                </h3>
+                <button
+                  type="button"
+                  onClick={() => setShowGlowColorGuide(!showGlowColorGuide)}
+                  className={cn(
+                    "px-2 py-1 rounded-lg transition-colors flex items-center gap-1 text-[10px] font-bold border shrink-0 cursor-pointer shadow-sm",
+                    showGlowColorGuide
+                      ? "bg-indigo-50 border-indigo-200 text-indigo-700"
+                      : "bg-white border-slate-200 text-slate-500 hover:bg-slate-50"
+                  )}
+                  title={lang === 'zh' ? '控制参数指南说明' : 'View parameter guide'}
+                >
+                  <HelpCircle className="w-3.5 h-3.5" />
+                  {lang === 'zh' ? '说明指南' : 'Guide'}
+                </button>
+              </div>
+
+              {showGlowColorGuide && (
+                <div className="p-3.5 bg-indigo-50 border border-indigo-100 rounded-xl flex flex-col gap-2 shadow-inner text-[10px] text-indigo-950 font-medium leading-relaxed">
+                  <div className="font-bold text-indigo-900 border-b border-indigo-200 pb-1.5 flex items-center gap-1.5 font-sans">
+                    <HelpCircle className="w-4 h-4 text-indigo-600" />
+                    <span>{lang === 'zh' ? '💡 参数整理效果提示' : '💡 Parameter Guide'}</span>
+                  </div>
+                  {lang === 'zh' ? (
+                    <ul className="list-disc pl-4 flex flex-col gap-1.5 text-[9px] text-indigo-850 font-medium">
+                      <li><strong>目标检测色:</strong> 用于搜寻特定区域发光的参考基准。强烈建议使用吸管，点击吸取白边内部真实的青蓝色或淡蓝色像素，而非直接设置纯白。</li>
+                      <li><strong>TOLERANCE 容差:</strong> 控制目标颜色抓取范围，数值越高搜索匹配的同种光感色调广度越大。</li>
+                      <li><strong>BINS 阶数:</strong> 在限定的高光选区内部聚类出的核心调色盘颜色数量。推荐 4 到 8，让繁杂的混合白边收紧为几类富有像素感的手绘风固定色阶！</li>
+                      <li><strong>STRENGTH %:</strong> 原始颜色向色阶归并覆盖的百分比浓度（100%为全然合并覆盖，较小比例下做柔和的淡化融合）。</li>
+                      <li><strong>MIN ALPHA:</strong> 对像素简化整理的底限透明度保护。低于此透明度的发散柔和轻羽边缘将完全豁免分类，避免渐隐黑边。</li>
+                      <li><strong>LUMA MIN / MAX 亮度范围:</strong> 仅对属于该阶梯值区间的像素执行简化（例如设置 40-250 便能有效避开极暗处阴影或最亮白色盲点块）。</li>
+                      <li><strong>共享色盘自由调整 (点击色阶 Palette 区域):</strong> </li>
+                      <span className="text-indigo-900/80 block mt-[-3px] pl-1 font-semibold leading-relaxed">
+                        点击上方【生成共享 Palette】后，产生的精细色阶：<br/>
+                        1. **点击色块** 可调起系统色轮，即时精修更改特定色阶 RGB；<br/>
+                        2. **悬浮色块右上角并点击 [×]** 可删除弃用某主阶，降低发光噪点；<br/>
+                        3. **点击 [+]** 在末尾可以自由补加自定义阶梯色。<br/>
+                        如此调配后，点击【处理】即可极其精确地合并你所设定的终极光效！
+                      </span>
+                    </ul>
+                  ) : (
+                    <ul className="list-disc pl-4 flex flex-col gap-1.5 text-[9px] text-indigo-850 font-medium">
+                      <li><strong>Target Hue:</strong> Standard base tone of your specular highlights. Refrain from pure white; sample light cyan/blue using the pipette.</li>
+                      <li><strong>TOLERANCE (15-160):</strong> Match size threshold around Target Hue.</li>
+                      <li><strong>BINS (2-12):</strong> Color ceiling. Re-maps complex, noisy anti-aliasing pixels into exactly this many tidy, crisp retro color steps. Setting to 4-8 is best.</li>
+                      <li><strong>STRENGTH (0-100%):</strong> Amount of original pixel RGB being replaced with the nearest snapped palette color.</li>
+                      <li><strong>MIN ALPHA:</strong> Alpha gate protecting smooth outer fades and gradient borders.</li>
+                      <li><strong>LUMA MIN/MAX (0-255):</strong> Restricts simplifying inside active luminosity boundaries so solid darkest hues or light hot spots are guarded.</li>
+                      <li><strong>Custom Shared Palette Editing Actions:</strong></li>
+                      <span className="text-indigo-900/8 block mt-[-3px] pl-1 font-semibold leading-relaxed">
+                        Generate first by clicking "Build Shared Palette", then enjoy custom fine-tuning:<br/>
+                        1. **Click on any swatch** to pull up native color picker and adjust its coordinates.<br/>
+                        2. **Hover on a swatch** & click the [×] badge in top-right to erase it.<br/>
+                        3. **Click [+]** to manually append customized colors to your processing lookup.<br/>
+                        Hit "Current Frame" or "Clean All" once content matches perfectly!
+                      </span>
+                    </ul>
+                  )}
+                </div>
+              )}
+
+              {frames.length === 0 ? (
+                <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl flex flex-col gap-3 shadow-sm">
+                  <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">
+                    {lang === 'zh' ? '在此导入媒体' : 'Import Media Here'}
+                  </span>
+                  <p className="text-[10px] text-slate-400 font-medium leading-relaxed">
+                    {lang === 'zh'
+                      ? '用于整理白色/青白光效内部的可见 RGB 杂色，不修改 Alpha。'
+                      : 'Simplifies visible RGB noise inside glow highlights without changing alpha.'}
+                  </p>
+
+                  <div className="flex flex-col gap-2 mt-1">
+                    <button
+                      type="button"
+                      onClick={() => document.getElementById('initial-upload-trigger')?.click()}
+                      className="w-full py-2 bg-indigo-600 text-white rounded-lg text-xs font-bold hover:bg-indigo-700 transition flex items-center justify-center gap-1.5 shadow"
+                    >
+                      <Upload className="w-3.5 h-3.5" />
+                      {lang === 'zh' ? '导入源素材' : 'Import Media'}
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => document.getElementById('folder-upload-trigger')?.click()}
+                      className="w-full py-2 bg-white border border-slate-200 text-slate-700 rounded-lg text-xs font-bold hover:bg-slate-50 transition flex items-center justify-center gap-1.5 shadow-sm"
+                    >
+                      <Folder className="w-3.5 h-3.5 text-indigo-600" />
+                      {t('selectFolder')}
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <p className="text-[10px] text-slate-400 font-semibold leading-relaxed">
+                    {lang === 'zh'
+                      ? '处理白色/青白高光内部的 RGB 杂色。不会删除像素，不会修改 Alpha，不会模糊。请先用吸管吸取白边内部真实颜色。'
+                      : 'Simplifies internal RGB noise in cyan/white highlights. It does not delete pixels, change alpha, or blur.'}
+                  </p>
+
+                  {/* Backdrop checker */}
+                  <div className="flex flex-col gap-1.5">
+                    <span className="text-[9px] font-bold text-slate-500 uppercase">{t('canvasBG')}</span>
+                    <div className="grid grid-cols-5 gap-1.5">
+                      <button 
+                        type="button"
+                        title={t('transparentCheck')}
+                        onClick={() => setCleanupBGMock('transparent')}
+                        className={cn("aspect-square rounded border-2 checkerboard", cleanupBGMock === 'transparent' ? 'border-indigo-600 scale-105 shadow' : 'border-slate-200')}
+                      />
+                      <button 
+                        type="button"
+                        title={t('whiteBG')}
+                        onClick={() => setCleanupBGMock('white')}
+                        className={cn("aspect-square rounded border-2 bg-white", cleanupBGMock === 'white' ? 'border-slate-800 scale-105 shadow' : 'border-slate-200')}
+                      />
+                      <button 
+                        type="button"
+                        title={t('blackBG')}
+                        onClick={() => setCleanupBGMock('black')}
+                        className={cn("aspect-square rounded border-2 bg-black", cleanupBGMock === 'black' ? 'border-slate-800 scale-105 shadow' : 'border-slate-200')}
+                      />
+                      <button 
+                        type="button"
+                        title={t('greenBG')}
+                        onClick={() => setCleanupBGMock('green')}
+                        className={cn("aspect-square rounded border-2 bg-[#00ff00]", cleanupBGMock === 'green' ? 'border-slate-800 scale-105 shadow' : 'border-slate-200')}
+                      />
+                      <button 
+                        type="button"
+                        title={t('pinkBG')}
+                        onClick={() => setCleanupBGMock('pink')}
+                        className={cn("aspect-square rounded border-2 bg-[#ff00ff]", cleanupBGMock === 'pink' ? 'border-slate-800 scale-105 shadow' : 'border-slate-200')}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="p-4 bg-slate-50 border border-slate-100 rounded-xl flex flex-col gap-3">
+                    <span className="text-[9px] font-bold text-slate-500 uppercase tracking-wider">
+                      {lang === 'zh' ? '目标颜色族' : 'Target Color Family'}
+                    </span>
+
+                    <div className="flex gap-2">
+                      <div className="relative flex-1 h-10 rounded-xl border bg-white p-2 flex items-center gap-2 shadow-sm">
+                        <div className="w-5 h-5 rounded border shadow-inner" style={{ backgroundColor: glowColorTarget }} />
+                        <span className="text-[10px] font-mono font-bold text-slate-600 uppercase">{glowColorTarget}</span>
+                        <input
+                          type="color"
+                          value={glowColorTarget}
+                          onChange={(e) => {
+                            setGlowColorTarget(e.target.value.toUpperCase());
+                            setGlowColorPalette([]);
+                          }}
+                          className="absolute inset-0 opacity-0 cursor-pointer"
+                        />
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={() => setGlowColorPipetteActive(!glowColorPipetteActive)}
+                        className={cn(
+                          "p-2 rounded-xl border flex items-center justify-center transition shadow-sm",
+                          glowColorPipetteActive
+                            ? "bg-indigo-600 text-white border-indigo-600"
+                            : "bg-white text-slate-600 border-slate-200 hover:bg-slate-50"
+                        )}
+                        title="Pipette target color"
+                      >
+                        <Pipette className="w-5 h-5" />
+                      </button>
+                    </div>
+
+                    {glowColorPipetteActive && (
+                      <p className="text-[8px] text-indigo-600 leading-normal font-semibold italic">
+                        {lang === 'zh'
+                          ? '点击预览图中的白边内部像素，建议不要吸纯白，吸青白/蓝白实际杂色。'
+                          : 'Click an internal glow pixel. Sample the actual color around the highlights.'}
+                      </p>
+                    )}
+                  </div>
+
+                  <div className="p-4 bg-white border border-slate-100 rounded-xl flex flex-col gap-3 shadow-sm">
+                    <div className="flex items-center gap-2">
+                      <input
+                        id="glow-color-use-raw"
+                        type="checkbox"
+                        checked={glowColorUseRawFrames}
+                        onChange={(e) => setGlowColorUseRawFrames(e.target.checked)}
+                        className="rounded text-indigo-600"
+                      />
+                      <label htmlFor="glow-color-use-raw" className="text-[10px] font-bold text-slate-500 cursor-pointer">
+                        {lang === 'zh' ? '优先以 rawFrames / 原始帧处理' : 'Prefer rawFrames/source frames'}
+                      </label>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-3">
+                      <label className="flex flex-col gap-1">
+                        <span className="text-[9px] font-bold text-slate-500 uppercase">TOLERANCE {glowColorTolerance}</span>
+                        <input
+                          type="range"
+                          min="15"
+                          max="160"
+                          value={glowColorTolerance}
+                          onChange={(e) => {
+                            setGlowColorTolerance(parseInt(e.target.value, 10));
+                            setGlowColorPalette([]);
+                          }}
+                          className="w-full accent-indigo-600"
+                        />
+                      </label>
+
+                      <label className="flex flex-col gap-1">
+                        <span className="text-[9px] font-bold text-slate-500 uppercase">BINS {glowColorBins}</span>
+                        <input
+                          type="range"
+                          min="2"
+                          max="12"
+                          value={glowColorBins}
+                          onChange={(e) => {
+                            setGlowColorBins(parseInt(e.target.value, 10));
+                            setGlowColorPalette([]);
+                          }}
+                          className="w-full accent-indigo-600"
+                        />
+                      </label>
+
+                      <label className="flex flex-col gap-1">
+                        <span className="text-[9px] font-bold text-slate-500 uppercase">STRENGTH {glowColorStrength}%</span>
+                        <input
+                          type="range"
+                          min="0"
+                          max="100"
+                          value={glowColorStrength}
+                          onChange={(e) => setGlowColorStrength(parseInt(e.target.value, 10))}
+                          className="w-full accent-indigo-600"
+                        />
+                      </label>
+
+                      <label className="flex flex-col gap-1">
+                        <span className="text-[9px] font-bold text-slate-500 uppercase">MIN ALPHA {glowColorMinAlpha}</span>
+                        <input
+                          type="range"
+                          min="0"
+                          max="255"
+                          value={glowColorMinAlpha}
+                          onChange={(e) => setGlowColorMinAlpha(parseInt(e.target.value, 10))}
+                          className="w-full accent-indigo-600"
+                        />
+                      </label>
+
+                      <label className="flex flex-col gap-1">
+                        <span className="text-[9px] font-bold text-slate-500 uppercase">MIN LUMA {glowColorMinLuma}</span>
+                        <input
+                          type="range"
+                          min="0"
+                          max="255"
+                          value={glowColorMinLuma}
+                          onChange={(e) => {
+                            setGlowColorMinLuma(parseInt(e.target.value, 10));
+                            setGlowColorPalette([]);
+                          }}
+                          className="w-full accent-indigo-600"
+                        />
+                      </label>
+
+                      <label className="flex flex-col gap-1">
+                        <span className="text-[9px] font-bold text-slate-500 uppercase">MAX LUMA {glowColorMaxLuma}</span>
+                        <input
+                          type="range"
+                          min="0"
+                          max="255"
+                          value={glowColorMaxLuma}
+                          onChange={(e) => {
+                            setGlowColorMaxLuma(parseInt(e.target.value, 10));
+                            setGlowColorPalette([]);
+                          }}
+                          className="w-full accent-indigo-600"
+                        />
+                      </label>
+                    </div>
+                  </div>
+
+                  <div className="p-4 bg-slate-50 border border-slate-100 rounded-xl flex flex-col gap-3">
+                    <div className="flex justify-between items-center">
+                      <span className="text-[9px] font-bold text-slate-500 uppercase">
+                        {lang === 'zh' ? '共享色阶 Palette' : 'Shared Palette'}
+                      </span>
+                      <span className="text-[9px] text-slate-400 font-mono font-bold">
+                        {glowColorPalette.length} colors
+                      </span>
+                    </div>
+
+                    <div className="flex flex-wrap gap-2 min-h-12 border rounded-xl p-2 bg-white font-bold items-center">
+                      {glowColorPalette.length === 0 ? (
+                        <span className="text-[9px] text-slate-400 font-semibold italic">
+                          {lang === 'zh' ? '尚未生成 Palette' : 'No palette yet'}
+                        </span>
+                      ) : (
+                        glowColorPalette.map((color, idx) => {
+                          const hexValue = rgbToHex(color);
+                          return (
+                            <div
+                              key={`${color.join('-')}-${idx}`}
+                              className="relative w-8 h-8 rounded-lg border border-slate-300 shadow-sm bg-white p-0.5 group shrink-0"
+                              title={lang === 'zh' ? `点击色块修改，悬浮右上角删除: ${hexValue}` : `Click to edit, hover top-right to delete: ${hexValue}`}
+                            >
+                              <div 
+                                className="w-full h-full rounded-md relative overflow-hidden flex items-center justify-center transition-transform group-hover:scale-105"
+                                style={{ backgroundColor: hexValue }}
+                              >
+                                <input
+                                  type="color"
+                                  value={hexValue}
+                                  onChange={(e) => {
+                                    const newHex = e.target.value;
+                                    const rgb = hexToRgb(newHex);
+                                    if (rgb) {
+                                      const updatedPalette = [...glowColorPalette];
+                                      updatedPalette[idx] = rgb;
+                                      setGlowColorPalette(updatedPalette);
+                                    }
+                                  }}
+                                  className="absolute inset-0 opacity-0 cursor-pointer w-full h-full z-15"
+                                />
+                                <span className="pointer-events-none text-[8px] font-mono text-white mix-blend-difference opacity-0 group-hover:opacity-100 transition select-none z-0">
+                                  {hexValue.substring(1)}
+                                </span>
+                              </div>
+
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  e.preventDefault();
+                                  const updatedPalette = [...glowColorPalette];
+                                  updatedPalette.splice(idx, 1);
+                                  setGlowColorPalette(updatedPalette);
+                                }}
+                                className="absolute -top-1.5 -right-1.5 w-3.5 h-3.5 bg-red-500 hover:bg-red-600 text-white rounded-full flex items-center justify-center shadow text-[8px] font-black opacity-0 group-hover:opacity-100 transition z-20 cursor-pointer border border-white"
+                                title={lang === 'zh' ? '删除此颜色' : 'Delete this color'}
+                              >
+                                ×
+                              </button>
+                            </div>
+                          );
+                        })
+                      )}
+
+                      <button 
+                        type="button"
+                        onClick={() => {
+                          const defaultRGB = hexToRgb(glowColorTarget) || [184, 240, 239];
+                          setGlowColorPalette(prev => [...prev, defaultRGB]);
+                        }}
+                        className="w-8 h-8 rounded-lg border border-dashed border-slate-200 hover:border-indigo-400 flex items-center justify-center cursor-pointer transition shrink-0 bg-slate-50 hover:bg-slate-100"
+                        title={lang === 'zh' ? '添加自定义分类色' : 'Add custom color'}
+                       >
+                         <Plus className="w-3.5 h-3.5 text-slate-400 hover:text-indigo-600" />
+                       </button>
+                    </div>
+
+                    <div className="text-[9px] text-slate-400 font-mono font-bold leading-relaxed">
+                      MATCHED: {glowColorMatchedPixels} / SAMPLED: {glowColorSampledPixels}
+                    </div>
+
+                    {glowColorBeforeStats && glowColorAfterStats && (
+                      <div className="text-[9px] text-slate-500 font-mono font-bold leading-relaxed bg-white rounded-lg border p-2">
+                        BEFORE UNIQUE: {glowColorBeforeStats.uniqueColors}
+                        <br />
+                        AFTER UNIQUE: {glowColorAfterStats.uniqueColors}
+                      </div>
+                    )}
+
+                    <button
+                      type="button"
+                      onClick={buildSharedGlowColorPalette}
+                      disabled={isGlowColorSimplifying}
+                      className="w-full py-2 rounded-lg bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 font-bold text-[10px] uppercase flex items-center justify-center gap-1.5 transition cursor-pointer shadow-sm"
+                    >
+                      {isGlowColorSimplifying ? <Loader2 className="w-3.5 h-3.5 animate-spin text-slate-400" /> : null}
+                      {lang === 'zh' ? '生成共享 Palette' : 'Build Shared Palette'}
+                    </button>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => runGlowColorSimplify(false)}
+                      disabled={isGlowColorSimplifying}
+                      className="py-2.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-250 text-white font-bold text-[9px] uppercase tracking-wider transition flex items-center justify-center gap-1.5 cursor-pointer shadow-sm"
+                    >
+                      {isGlowColorSimplifying ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : null}
+                      {lang === 'zh' ? '处理当前帧' : 'Current Frame'}
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => runGlowColorSimplify(true)}
+                      disabled={isGlowColorSimplifying}
+                      className="py-2.5 rounded-lg bg-indigo-50 border border-indigo-150 text-indigo-700 hover:bg-indigo-100 disabled:bg-slate-100 font-bold text-[9px] uppercase tracking-wider transition flex items-center justify-center gap-1.5 cursor-pointer shadow-sm"
+                    >
+                      {isGlowColorSimplifying ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : null}
+                      {lang === 'zh' ? `处理全部 ${progress}%` : `All Frames ${progress}%`}
+                    </button>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2 pb-2">
+                    <button
+                      type="button"
+                      onClick={undoGlowColorSimplify}
+                      disabled={glowColorHistory.length === 0}
+                      className={cn(
+                        "py-2 rounded-lg font-bold text-[9px] uppercase tracking-wider transition flex items-center justify-center gap-1.5 cursor-pointer",
+                        glowColorHistory.length > 0
+                          ? "bg-amber-500 hover:bg-amber-600 text-white shadow-sm"
+                          : "bg-slate-100 text-slate-400 cursor-not-allowed border border-slate-200/50"
+                      )}
+                    >
+                      <Undo className="w-3 h-3" />
+                      {lang === 'zh' ? '撤销' : 'Undo'}
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={commitGlowColorSimplify}
+                      className="py-2 rounded-lg border border-emerald-500 bg-emerald-50 text-emerald-700 hover:bg-emerald-100 font-bold text-[9px] uppercase tracking-wider transition flex items-center justify-center gap-1.5 cursor-pointer shadow-sm"
+                    >
+                      <Check className="w-3 h-3" />
+                      {lang === 'zh' ? '提交为原始帧' : 'Commit'}
+                    </button>
+                  </div>
                 </>
               )}
             </div>
@@ -3110,22 +4624,12 @@ export default function App() {
                   <h3 className="text-lg font-bold text-slate-800 mb-1 tracking-tight">{t('importTitle')}</h3>
                   <p className="text-xs text-slate-400 font-semibold">{t('dragPlaceholder')}</p>
                 </div>
-                <input id="initial-upload-trigger" type="file" className="hidden" accept="video/*,image/*" multiple onChange={(e) => {
-                  const first = e.target.files?.[0];
-                  if (first) {
-                    if (first.type.startsWith('video/')) loadVideo(first);
-                    else {
-                      setBatchFiles(Array.from(e.target.files || []));
-                      setCurrentTab('batch');
-                    }
-                  }
-                }} />
               </div>
 
             ) : (
               
               /* Active working area canvas previewer */
-              <div className="flex flex-col gap-6 max-w-4xl mx-auto h-full">
+              <div className="flex flex-col gap-6 max-w-[1400px] w-full mx-auto h-full">
                 
                 <div className="bg-white rounded-3xl border border-slate-200 p-3 shadow-xl relative overflow-hidden shrink-0 flex items-center justify-center min-h-[420px]">
                   
@@ -3143,8 +4647,8 @@ export default function App() {
                             : "max-w-full rounded-lg"
                         )}
                         style={{
-                          width: '800px',
-                          maxWidth: '100%',
+                          width: '100%',
+                          maxWidth: '1200px',
                           height: 'auto',
                           aspectRatio: videoDimensions.width && videoDimensions.height ? `${videoDimensions.width} / ${videoDimensions.height}` : '16/9',
                           objectFit: 'contain'
@@ -3160,8 +4664,8 @@ export default function App() {
                       <div 
                         className="relative flex items-center justify-center max-w-full"
                         style={{
-                          width: '800px',
-                          maxWidth: '100%',
+                          width: '100%',
+                          maxWidth: '1200px',
                           aspectRatio: videoDimensions.width && videoDimensions.height ? `${videoDimensions.width} / ${videoDimensions.height}` : 'auto',
                         }}
                       >
@@ -3181,7 +4685,7 @@ export default function App() {
                         <canvas 
                           className={cn(
                             "absolute inset-0 z-20 cursor-crosshair opacity-75",
-                            (currentTab === 'translucent' || cleanupProtectActive || stainPipetteActive) ? 'pointer-events-auto' : 'pointer-events-none'
+                            (currentTab === 'translucent' || (currentTab === 'cleanup' && cleanupProtectActive) || stainPipetteActive || (currentTab === 'glowColorSimplify' && glowColorPipetteActive)) ? 'pointer-events-auto' : 'pointer-events-none'
                           )}
                           width={frames[previewIndex]?.blob ? Math.round(videoDimensions.width / scaleFactor || 64) : 64}
                           height={frames[previewIndex]?.blob ? Math.round(videoDimensions.height / scaleFactor || 64) : 64}
@@ -3192,7 +4696,7 @@ export default function App() {
                           }}
                           onMouseDown={(e) => {
                             if (currentTab === 'translucent') setIsDrawingTrimap(true);
-                            if (currentTab === 'cleanup' && !stainPipetteActive) setIsDrawingProtect(true);
+                            if ((currentTab === 'cleanup' || currentTab === 'glowCleanup') && !stainPipetteActive) setIsDrawingProtect(true);
                             handleCanvasInteraction(e);
                           }}
                           onMouseMove={(e) => {
@@ -3211,7 +4715,7 @@ export default function App() {
                         />
 
                         {/* Semi-transparent protective overlay stencil for user helper visual mask */}
-                        {currentTab === 'cleanup' && protectMasks[previewIndex] && (
+                        {(currentTab === 'cleanup' || currentTab === 'glowCleanup') && protectMasks[previewIndex] && (
                           <div className="absolute inset-0 pointer-events-none z-15 bg-red-500/20 mix-blend-multiply rounded-lg">
                             {/* Draws active protect coverage on image bounding box */}
                           </div>
@@ -3232,7 +4736,7 @@ export default function App() {
                     )}
 
                     {/* Heavy algorithm processes loader */}
-                    {(isProcessing || isMattingSequence || isQuantizing || isCleaningProgress) && (
+                    {(isProcessing || isMattingSequence || isQuantizing || isCleaningProgress || isBatchRunning || isGlowColorSimplifying) && (
                       <div className="absolute inset-0 bg-slate-950/70 backdrop-blur-sm flex flex-col items-center justify-center gap-4 z-40">
                         <div className="w-48 h-1.5 bg-slate-800 rounded-full overflow-hidden">
                           <motion.div 
