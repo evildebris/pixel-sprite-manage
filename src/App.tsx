@@ -388,6 +388,7 @@ export default function App() {
   const [currentTrimapDataUrl, setCurrentTrimapDataUrl] = useState<string>('');
   const [currentCoreDataUrl, setCurrentCoreDataUrl] = useState<string>('');
   const [currentGlowDataUrl, setCurrentGlowDataUrl] = useState<string>('');
+  const [currentPureGlowDataUrl, setCurrentPureGlowDataUrl] = useState<string>('');
   const [currentFinalDataUrl, setCurrentFinalDataUrl] = useState<string>('');
 
   // Edge Cleanup States
@@ -1498,17 +1499,25 @@ export default function App() {
       glowCanvas.height = height;
       const gCtx = glowCanvas.getContext('2d');
 
+      const pureGlowCanvas = document.createElement('canvas');
+      pureGlowCanvas.width = width;
+      pureGlowCanvas.height = height;
+      const pgCtx = pureGlowCanvas.getContext('2d');
+
       const finalCanvas = document.createElement('canvas');
       finalCanvas.width = width;
       finalCanvas.height = height;
       const fCtx = finalCanvas.getContext('2d');
 
-      if (cCtx && gCtx && fCtx) {
+      if (cCtx && gCtx && pgCtx && fCtx) {
         const cImg = cCtx.createImageData(width, height);
         const cData = cImg.data;
 
         const gImg = gCtx.createImageData(width, height);
         const gData = gImg.data;
+
+        const pgImg = pgCtx.createImageData(width, height);
+        const pgData = pgImg.data;
 
         const fImg = fCtx.createImageData(width, height);
         const fData = fImg.data;
@@ -1560,7 +1569,7 @@ export default function App() {
           let glowAlpha = 0;
 
           if (tVal === 255) {
-            coreAlpha = pureGlowMode ? 0.0 : 1.0;
+            coreAlpha = 1.0;
             glowAlpha = 1.0;
           } else if (tVal === 0) {
             coreAlpha = 0.0;
@@ -1575,16 +1584,12 @@ export default function App() {
             const tHigh = tLow + coreTolerance * 1.5 + 20;
 
             // 1. Delta Keyer (Core Alpha - 第一步提取纯主体)
-            if (pureGlowMode) {
+            if (dist >= tHigh) {
+              coreAlpha = 1.0;
+            } else if (dist <= tLow) {
               coreAlpha = 0.0;
             } else {
-              if (dist >= tHigh) {
-                coreAlpha = 1.0;
-              } else if (dist <= tLow) {
-                coreAlpha = 0.0;
-              } else {
-                coreAlpha = (dist - tLow) / (tHigh - tLow);
-              }
+              coreAlpha = (dist - tLow) / (tHigh - tLow);
             }
 
             // 2. Luma / Channel Mask for Glow (Glow Alpha - 第二步提取半透明光晕与星芒)
@@ -1660,26 +1665,33 @@ export default function App() {
             gData[pxIdx+3] = 0;
           }
 
+          // Pure Glow RGBA (No Solid Core / Hollowed Out inside solid character region)
+          let pureGlowAlpha = 0;
+          if (tVal === 255) {
+            pureGlowAlpha = 0.0;
+          } else if (tVal === 0) {
+            pureGlowAlpha = 0.0;
+          } else {
+            pureGlowAlpha = glowAlpha;
+          }
+
+          if (pureGlowAlpha > 0) {
+            const pgr = Math.max(0, Math.min(255, (rawR - (1 - pureGlowAlpha) * bgR) / pureGlowAlpha));
+            const pgg = Math.max(0, Math.min(255, (rawG - (1 - pureGlowAlpha) * bgG) / pureGlowAlpha));
+            const pgb = Math.max(0, Math.min(255, (rawB - (1 - pureGlowAlpha) * bgB) / pureGlowAlpha));
+            pgData[pxIdx] = Math.round(pgr);
+            pgData[pxIdx+1] = Math.round(pgg);
+            pgData[pxIdx+2] = Math.round(pgb);
+            pgData[pxIdx+3] = Math.round(pureGlowAlpha * 255);
+          } else {
+            pgData[pxIdx] = 0;
+            pgData[pxIdx+1] = 0;
+            pgData[pxIdx+2] = 0;
+            pgData[pxIdx+3] = 0;
+          }
+
           // 3. Synthesis and De-black / Unpremultiply (第三步 融合融合与完美去黑)
           let synthesisCoreAlpha = coreAlpha;
-          if (pureGlowMode) {
-            if (tVal === 255) {
-              synthesisCoreAlpha = 1.0;
-            } else if (tVal === 0) {
-              synthesisCoreAlpha = 0.0;
-            } else {
-              const dist = Math.sqrt((rawR - bgR)**2 + (rawG - bgG)**2 + (rawB - bgB)**2);
-              const tLow = tolerance;
-              const tHigh = tLow + coreTolerance * 1.5 + 20;
-              if (dist >= tHigh) {
-                synthesisCoreAlpha = 1.0;
-              } else if (dist <= tLow) {
-                synthesisCoreAlpha = 0.0;
-              } else {
-                synthesisCoreAlpha = (dist - tLow) / (tHigh - tLow);
-              }
-            }
-          }
 
           const finalAlpha = Math.max(synthesisCoreAlpha, glowAlpha);
           let finalR = rawR;
@@ -1715,10 +1727,12 @@ export default function App() {
 
         cCtx.putImageData(cImg, 0, 0);
         gCtx.putImageData(gImg, 0, 0);
+        pgCtx.putImageData(pgImg, 0, 0);
         fCtx.putImageData(fImg, 0, 0);
 
         setCurrentCoreDataUrl(coreCanvas.toDataURL('image/png'));
         setCurrentGlowDataUrl(glowCanvas.toDataURL('image/png'));
+        setCurrentPureGlowDataUrl(pureGlowCanvas.toDataURL('image/png'));
         setCurrentFinalDataUrl(finalCanvas.toDataURL('image/png'));
       }
     };
@@ -1762,11 +1776,13 @@ export default function App() {
           trimap = defaultTrimapForImage(imgData, transparentColor, tolerance, pureGlowMode, glowRadiusVal);
         }
 
-        // Generate Core, Glow, and final merged arrays
+        // Generate Core, Glow, Pure Glow, and final merged arrays
         const cImg = localCtx.createImageData(localCanvas.width, localCanvas.height);
         const cData = cImg.data;
         const gImg = localCtx.createImageData(localCanvas.width, localCanvas.height);
         const gData = gImg.data;
+        const pgImg = localCtx.createImageData(localCanvas.width, localCanvas.height);
+        const pgData = pgImg.data;
         const fImg = localCtx.createImageData(localCanvas.width, localCanvas.height);
         const fData = fImg.data;
 
@@ -1815,7 +1831,7 @@ export default function App() {
           let glowAlpha = 0;
 
           if (tVal === 255) {
-            coreAlpha = pureGlowMode ? 0.0 : 1.0;
+            coreAlpha = 1.0;
             glowAlpha = 1.0;
           } else if (tVal === 0) {
             coreAlpha = 0.0;
@@ -1830,16 +1846,12 @@ export default function App() {
             const tHigh = tLow + coreTolerance * 1.5 + 20;
 
             // 1. Delta Keyer (Core Alpha - 第一步提取纯主体)
-            if (pureGlowMode) {
+            if (dist >= tHigh) {
+              coreAlpha = 1.0;
+            } else if (dist <= tLow) {
               coreAlpha = 0.0;
             } else {
-              if (dist >= tHigh) {
-                coreAlpha = 1.0;
-              } else if (dist <= tLow) {
-                coreAlpha = 0.0;
-              } else {
-                coreAlpha = (dist - tLow) / (tHigh - tLow);
-              }
+              coreAlpha = (dist - tLow) / (tHigh - tLow);
             }
 
             // 2. Luma / Channel Mask for Glow (Glow Alpha - 提取半透明发光与星芒)
@@ -1915,26 +1927,33 @@ export default function App() {
             gData[pxIdx+3] = 0;
           }
 
+          // Fill Pure Glow RGBA (Hollowed out inside solid character region)
+          let pureGlowAlpha = 0;
+          if (tVal === 255) {
+            pureGlowAlpha = 0.0;
+          } else if (tVal === 0) {
+            pureGlowAlpha = 0.0;
+          } else {
+            pureGlowAlpha = glowAlpha;
+          }
+
+          if (pureGlowAlpha > 0) {
+            const pgr = Math.max(0, Math.min(255, (rawR - (1 - pureGlowAlpha) * bgR) / pureGlowAlpha));
+            const pgg = Math.max(0, Math.min(255, (rawG - (1 - pureGlowAlpha) * bgG) / pureGlowAlpha));
+            const pgb = Math.max(0, Math.min(255, (rawB - (1 - pureGlowAlpha) * bgB) / pureGlowAlpha));
+            pgData[pxIdx] = Math.round(pgr);
+            pgData[pxIdx+1] = Math.round(pgg);
+            pgData[pxIdx+2] = Math.round(pgb);
+            pgData[pxIdx+3] = Math.round(pureGlowAlpha * 255);
+          } else {
+            pgData[pxIdx] = 0;
+            pgData[pxIdx+1] = 0;
+            pgData[pxIdx+2] = 0;
+            pgData[pxIdx+3] = 0;
+          }
+
           // 3. Synthesis and De-black / Unpremultiply (合成与去溢色反预乘)
           let synthesisCoreAlpha = coreAlpha;
-          if (pureGlowMode) {
-            if (tVal === 255) {
-              synthesisCoreAlpha = 1.0;
-            } else if (tVal === 0) {
-              synthesisCoreAlpha = 0.0;
-            } else {
-              const dist = Math.sqrt((rawR - bgR)**2 + (rawG - bgG)**2 + (rawB - bgB)**2);
-              const tLow = tolerance;
-              const tHigh = tLow + coreTolerance * 1.5 + 20;
-              if (dist >= tHigh) {
-                synthesisCoreAlpha = 1.0;
-              } else if (dist <= tLow) {
-                synthesisCoreAlpha = 0.0;
-              } else {
-                synthesisCoreAlpha = (dist - tLow) / (tHigh - tLow);
-              }
-            }
-          }
 
           const finalAlpha = Math.max(synthesisCoreAlpha, glowAlpha);
           let finalR = rawR;
@@ -1960,7 +1979,7 @@ export default function App() {
             fData[pxIdx+2] = rawB;
             fData[pxIdx+3] = Math.round(synthesisCoreAlpha * 255);
           } else {
-            // 写入在任何正常混合棋盘格上都能100%渲染出通透无黑气的自发光发散前景和不透明度
+            // 写入在任何正常混合棋盘格上都能100%渲染出通透无黑气自发光前景和不透明度
             fData[pxIdx] = Math.round(finalR);
             fData[pxIdx+1] = Math.round(finalG);
             fData[pxIdx+2] = Math.round(finalB);
@@ -1978,6 +1997,11 @@ export default function App() {
         outGlowCanv.height = localCanvas.height;
         outGlowCanv.getContext('2d')?.putImageData(gImg, 0, 0);
 
+        const outPureGlowCanv = document.createElement('canvas');
+        outPureGlowCanv.width = localCanvas.width;
+        outPureGlowCanv.height = localCanvas.height;
+        outPureGlowCanv.getContext('2d')?.putImageData(pgImg, 0, 0);
+
         const outFinalCanv = document.createElement('canvas');
         outFinalCanv.width = localCanvas.width;
         outFinalCanv.height = localCanvas.height;
@@ -1992,7 +2016,8 @@ export default function App() {
           dataUrl: outFinalCanv.toDataURL('image/png'),
           blob: finalBlob,
           coreDataUrl: outCoreCanv.toDataURL('image/png'),
-          glowDataUrl: outGlowCanv.toDataURL('image/png')
+          glowDataUrl: outGlowCanv.toDataURL('image/png'),
+          pureGlowDataUrl: outPureGlowCanv.toDataURL('image/png')
         };
       }
     );
@@ -2613,59 +2638,52 @@ export default function App() {
         const finalFolder = zip.folder("final");
         const coreFolder = zip.folder("core");
         const glowFolder = zip.folder("glow");
+        
+        let pureGlowFolder = null;
+        if (pureGlowMode) {
+          pureGlowFolder = zip.folder("pure_glow");
+        }
 
         for (let idx = 0; idx < frames.length; idx++) {
           const frame = frames[idx];
           const filename = `frame_${idx.toString().padStart(4, '0')}.png`;
 
-          if (pureGlowMode && frame.coreDataUrl) {
-            // Under pureGlowMode, final should not blend glow effect, so we use core
+          finalFolder?.file(filename, frame.blob);
+          
+          if (frame.coreDataUrl) {
             const coreBlob = await fetch(frame.coreDataUrl).then(r => r.blob());
-            finalFolder?.file(filename, coreBlob);
             coreFolder?.file(filename, coreBlob);
-          } else {
-            finalFolder?.file(filename, frame.blob);
-            if (frame.coreDataUrl) {
-              const coreBlob = await fetch(frame.coreDataUrl).then(r => r.blob());
-              coreFolder?.file(filename, coreBlob);
-            }
           }
 
           if (frame.glowDataUrl) {
             const glowBlob = await fetch(frame.glowDataUrl).then(r => r.blob());
             glowFolder?.file(filename, glowBlob);
           }
+
+          if (pureGlowMode && frame.pureGlowDataUrl) {
+            const pureGlowBlob = await fetch(frame.pureGlowDataUrl).then(r => r.blob());
+            pureGlowFolder?.file(filename, pureGlowBlob);
+          }
         }
       } else {
         // Single sprite sheet mode
+        const spritesFolder = zip.folder("sprites");
+        
+        let pureGlowFolder = null;
         if (pureGlowMode) {
-          // Add a glow folder inside zip, and final sprites should be core (no glow)
-          const spritesFolder = zip.folder("sprites");
-          const glowFolder = zip.folder("glow");
+          pureGlowFolder = zip.folder("pure_glow");
+        }
 
-          for (let idx = 0; idx < frames.length; idx++) {
-            const frame = frames[idx];
-            const filename = `frame_${idx.toString().padStart(4, '0')}.png`;
+        for (let idx = 0; idx < frames.length; idx++) {
+          const frame = frames[idx];
+          const filename = `frame_${idx.toString().padStart(4, '0')}.png`;
 
-            if (frame.coreDataUrl) {
-              const coreBlob = await fetch(frame.coreDataUrl).then(r => r.blob());
-              spritesFolder?.file(filename, coreBlob);
-            } else {
-              spritesFolder?.file(filename, frame.blob);
-            }
+          spritesFolder?.file(filename, frame.blob);
 
-            if (frame.glowDataUrl) {
-              const glowBlob = await fetch(frame.glowDataUrl).then(r => r.blob());
-              glowFolder?.file(filename, glowBlob);
-            }
+          if (pureGlowMode && frame.pureGlowDataUrl) {
+            const pureGlowBlob = await fetch(frame.pureGlowDataUrl).then(r => r.blob());
+            pureGlowFolder?.file(filename, pureGlowBlob);
           }
-        } else {
-          // Normal zip packing
-          const spritesFolder = zip.folder("sprites");
-          frames.forEach((frame, idx) => {
-            const filename = `frame_${idx.toString().padStart(4, '0')}.png`;
-            spritesFolder?.file(filename, frame.blob);
-          });
         }
       }
     } else {
@@ -2718,6 +2736,7 @@ export default function App() {
       if (activePreviewMode === 'trimap') return currentTrimapDataUrl || frames[previewIndex]?.dataUrl || '';
       if (activePreviewMode === 'core') return currentCoreDataUrl || frames[previewIndex]?.dataUrl || '';
       if (activePreviewMode === 'glow') return currentGlowDataUrl || frames[previewIndex]?.dataUrl || '';
+      if (activePreviewMode === 'pure_glow') return currentPureGlowDataUrl || frames[previewIndex]?.pureGlowDataUrl || '';
       if (activePreviewMode === 'final') return currentFinalDataUrl || frames[previewIndex]?.dataUrl || '';
       return rawFrames[previewIndex]?.dataUrl || '';
     }
@@ -4591,7 +4610,7 @@ export default function App() {
             {/* Translucent matte preview channels */}
             {currentTab === 'translucent' && frames.length > 0 && (
               <div className="flex bg-slate-100 p-1 rounded-lg border border-slate-200 gap-1">
-                {(['source', 'trimap', 'core', 'glow', 'final'] as PreviewMode[]).map((mode) => (
+                {(['source', 'trimap', 'core', 'glow', 'pure_glow', 'final'] as PreviewMode[]).map((mode) => (
                   <button 
                     key={mode}
                     type="button"

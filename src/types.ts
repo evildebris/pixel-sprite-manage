@@ -5,13 +5,14 @@ export interface SpriteFrame {
   index: number;
   coreDataUrl?: string; // Translucent core matte layer
   glowDataUrl?: string; // Translucent glow matte layer
+  pureGlowDataUrl?: string; // Translucent pure glow (hollowed out core) layer
 }
 
 export type AppTab = 'video' | 'batch' | 'translucent' | 'cleanup' | 'glowCleanup' | 'glowColorSimplify';
 
 export type Language = 'zh' | 'en';
 
-export type PreviewMode = 'source' | 'trimap' | 'core' | 'glow' | 'final';
+export type PreviewMode = 'source' | 'trimap' | 'core' | 'glow' | 'pure_glow' | 'final';
 
 export type BlendMode = 'normal' | 'screen' | 'add';
 
